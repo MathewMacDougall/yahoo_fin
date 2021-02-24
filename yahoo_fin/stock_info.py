@@ -6,7 +6,7 @@ import ftplib
 import io
 import re
 import json
-import datetime
+from datetime import datetime, timedelta, timezone
 
 try:
     from requests_html import HTMLSession
@@ -121,6 +121,67 @@ def get_data(ticker, start_date = None, end_date = None, index_as_date = True,
         
     return frame
 
+
+def get_data_granular(ticker, start_date=None, end_date=None, index_as_date=True,
+             interval="1d"):
+    # This is a custom version of the get_data function which returns timezone-award datetimes (utc),
+    # and separates values by market open and close
+    '''Downloads historical stock price data into a pandas data frame.  Interval
+       must be "1d", "1wk", "1mo", or "1m" for daily, weekly, monthly, or minute data.
+       Intraday minute data is limited to 7 days.
+
+       @param: ticker
+       @param: start_date = None
+       @param: end_date = None
+       @param: index_as_date = True
+       @param: interval = "1d"
+    '''
+
+    if interval not in ("1d", "1wk", "1mo", "1m"):
+        raise AssertionError("interval must be of of '1d', '1wk', '1mo', or '1m'")
+
+    # build and connect to URL
+    site, params = build_url(ticker, start_date, end_date, interval)
+    resp = requests.get(site, params=params)
+
+    if not resp.ok:
+        raise AssertionError(resp.json())
+
+    # get JSON response
+    data = resp.json()
+
+    with open("/tmp/rawdata.json", 'w') as of:
+        of.write(json.dumps(data, indent=4))
+
+    # Timezone-aware datetime in UTC
+    utcnow = datetime.fromtimestamp(datetime.now().timestamp(), tz=timezone.utc)
+
+    trading_period_start = datetime.fromtimestamp(
+        data["chart"]["result"][0]["meta"]["currentTradingPeriod"]["regular"]["start"], tz=timezone.utc)
+    trading_period_end = datetime.fromtimestamp(
+        data["chart"]["result"][0]["meta"]["currentTradingPeriod"]["regular"]["end"], tz=timezone.utc)
+    trading_period_window = trading_period_end - trading_period_start
+
+    open_times = [datetime.fromtimestamp(t, tz=timezone.utc) for t in data["chart"]["result"][0]["timestamp"]]
+    open_times[-1] = min(open_times[-1], trading_period_start)
+    close_times = [t + trading_period_window for t in open_times]
+    close_times[-1] = min(close_times[-1], utcnow)
+
+    df_open = pd.DataFrame({"open": data["chart"]["result"][0]["indicators"]["quote"][0]["open"]}, index=open_times)
+    df_close = pd.DataFrame(data["chart"]["result"][0]["indicators"]["quote"][0], index=close_times)
+    df_close = df_close.drop(columns=["open"])
+    if interval != "1m":
+        df_close["adjclose"] = data["chart"]["result"][0]["indicators"]["adjclose"][0]["adjclose"]
+
+    frame = df_open.merge(df_close, how="outer", left_index=True, right_index=True)
+
+    frame['ticker'] = ticker.upper()
+
+    if not index_as_date:
+        frame = frame.reset_index()
+        frame.rename(columns={"index": "date"}, inplace=True)
+
+    return frame
 
 
 def tickers_sp500(include_company_data = False):
@@ -794,7 +855,7 @@ def get_next_earnings_date(ticker):
     
     temp = parsed_result['context']['dispatcher']['stores']['QuoteSummaryStore']['calendarEvents']['earnings']['earningsDate'][0]['raw']
 
-    return datetime.datetime.fromtimestamp(temp)
+    return datetime.fromtimestamp(temp)
 
 
 def get_earnings_history(ticker):
@@ -862,7 +923,7 @@ def get_earnings_in_date_range(start_date, end_date):
         
         current_date = pd.Timestamp(start_date)
         
-        dates = [current_date + datetime.timedelta(diff) for diff in range(days_diff + 1)]
+        dates = [current_date + timedelta(diff) for diff in range(days_diff + 1)]
         dates = [d.strftime("%Y-%m-%d") for d in dates]
  
         i = 0
